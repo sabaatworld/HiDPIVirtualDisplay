@@ -1279,9 +1279,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // `open` on a still-running app just activates it and the relaunch
         // never happens. Polls up to 20s, then opens regardless (harmless
         // no-op if we're somehow still alive).
+        // Use `nohup` to detach the watcher from our process group so it
+        // survives SIGHUP if we were launched from a terminal.
         let task = Process()
         task.launchPath = "/bin/sh"
-        task.arguments = ["-c", "for i in $(seq 1 40); do /usr/bin/pgrep -x HiDPIDisplay >/dev/null || break; /bin/sleep 0.5; done; /usr/bin/open \"\(Bundle.main.bundlePath)\""]
+        task.arguments = ["-c", "nohup /bin/sh -c 'for i in $(seq 1 40); do /usr/bin/pgrep -x HiDPIDisplay >/dev/null || break; /bin/sleep 0.5; done; /usr/bin/open \"\(Bundle.main.bundlePath)\"'" + " >/dev/null 2>&1 &"]
         task.launch()
 
         // Terminate current instance
@@ -1549,6 +1551,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let disableItem = NSMenuItem(title: "Disable HiDPI", action: #selector(disableHiDPIAction), keyEquivalent: "")
             disableItem.target = self
             menu.addItem(disableItem)
+
+            let reapplyItem = NSMenuItem(title: "Reapply HiDPI", action: #selector(reapplyHiDPIAction), keyEquivalent: "")
+            reapplyItem.target = self
+            menu.addItem(reapplyItem)
+
             menu.addItem(NSMenuItem.separator())
         } else {
             let statusItem = NSMenuItem(title: "No HiDPI active", action: nil, keyEquivalent: "")
@@ -2423,18 +2430,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Shared relaunch preamble for menu actions that restart the app.
+    /// - Parameters:
+    ///   - message: Status window message shown before restart
+    ///   - clearPreset: If true, clears the saved preset so relaunch does NOT restore HiDPI
+    private func scheduleRelaunch(message: String, clearPreset: Bool) {
+        debugLog("scheduleRelaunch: message=\(message), clearPreset=\(clearPreset), isActive=\(isActive)")
+        StatusWindowController.shared.show(message: message)
+        isRestarting = true
+        if clearPreset { clearSavedPreset() }
+        wasDisconnected = false
+        UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+            debugLog("scheduleRelaunch: firing relaunchApp()")
+            relaunchApp()
+        }
+    }
+
+    @objc func reapplyHiDPIAction() {
+        debugLog("reapplyHiDPIAction called, isRestarting=\(isRestarting), isActive=\(isActive)")
+        guard !isRestarting else { debugLog("reapplyHiDPIAction: blocked by isRestarting guard"); return }
+        // Reapply: restart and restore the current preset.
+        // The preset is already saved in kLastPresetKey from when it was first applied.
+        // Just relaunch — checkAndRestoreFromCrash() will re-apply it.
+        if isActive || hasOrphanedVirtualDisplay() {
+            scheduleRelaunch(message: "Reapplying HiDPI...", clearPreset: false)
+            return
+        }
+        // No active display — nothing to reapply
+        debugLog("reapplyHiDPIAction: no active display, rebuilding menu")
+        rebuildMenu()
+    }
+
     @objc func disableHiDPIAction() {
+        guard !isRestarting else { return }
         // Virtual displays persist until process exit — must restart to truly remove them
         if isActive || hasOrphanedVirtualDisplay() {
-            StatusWindowController.shared.show(message: "Disabling HiDPI...")
-            isRestarting = true
-            // Clear preset so relaunch does NOT restore
-            clearSavedPreset()
-            wasDisconnected = false
-            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-                relaunchApp()
-            }
+            scheduleRelaunch(message: "Disabling HiDPI...", clearPreset: true)
             return
         }
         // No active display — just clean up in-process state

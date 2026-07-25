@@ -10,6 +10,7 @@ APP_BUNDLE="${BUILD_DIR}/${APP_NAME}.app"
 CONTENTS="${APP_BUNDLE}/Contents"
 MACOS="${CONTENTS}/MacOS"
 RESOURCES="${CONTENTS}/Resources"
+MODULE_CACHE_DIR="${BUILD_DIR}/.module-cache"
 
 # Source files
 SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift"
@@ -21,6 +22,12 @@ echo "Building ${APP_NAME}..."
 # Create app bundle structure
 mkdir -p "${MACOS}"
 mkdir -p "${RESOURCES}"
+mkdir -p "${MODULE_CACHE_DIR}"
+
+# Some environments block writes to ~/.cache, which Swift uses for Clang
+# module caching while compiling the bridging header.
+export CLANG_MODULE_CACHE_PATH="${PWD}/${MODULE_CACHE_DIR}"
+export SWIFT_MODULECACHE_PATH="${PWD}/${MODULE_CACHE_DIR}"
 
 # Build a universal binary (arm64 + x86_64) so the app runs on both Apple
 # Silicon and Intel Macs. Each arch is compiled and linked separately, then
