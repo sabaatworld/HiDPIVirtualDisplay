@@ -13,7 +13,7 @@ RESOURCES="${CONTENTS}/Resources"
 MODULE_CACHE_DIR="${BUILD_DIR}/.module-cache"
 
 # Source files
-SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift Sources/DisplayArrangementManager.swift"
+SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift Sources/DisplayArrangementManager.swift Sources/MenuBarIcon.swift"
 OBJC_SOURCES="Sources/VirtualDisplayManager.m"
 BRIDGING_HEADER="Sources/BridgingHeader.h"
 
@@ -76,6 +76,11 @@ cp Info.plist "${CONTENTS}/"
 if [ -f "Resources/AppIcon.icns" ]; then
     cp Resources/AppIcon.icns "${RESOURCES}/"
     echo "App icon copied"
+fi
+
+if [ -f "Resources/MenuBarIcon.svg" ]; then
+    cp Resources/MenuBarIcon.svg "${RESOURCES}/"
+    echo "Menubar icon copied"
 fi
 
 # Sign the app with entitlements. Signing failures must fail the build —

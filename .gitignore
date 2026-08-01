@@ -29,6 +29,7 @@ DerivedData/
 *.swo
 *~
 \#*\#
+.superpowers/
 
 # IDE
 .idea/

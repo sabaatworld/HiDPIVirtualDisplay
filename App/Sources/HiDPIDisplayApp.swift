@@ -867,7 +867,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "HiDPI Display")
+            button.image = MenuBarIcon.make()
+            button.image?.accessibilityDescription = "HiDPI Display"
         }
 
         // Restore wasDisconnected state from UserDefaults (persists across restart)
