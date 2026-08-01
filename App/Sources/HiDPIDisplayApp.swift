@@ -879,12 +879,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // If orphaned virtual displays exist from a previous crash and this
         // isn't already a cleanup restart, terminate and relaunch so macOS
-        // reclaims the displays (we can't destroy cross-process displays via API)
-        if hasOrphanedVirtualDisplay() && !isCleanupRestart() {
-            debugLog("Orphaned virtual displays detected from previous crash, restarting to clean up...")
-            markCleanupRestart()
-            relaunchApp()
-            return
+        // reclaims the displays (we can't destroy cross-process displays via API).
+        if hasOrphanedVirtualDisplay() {
+            if !isCleanupRestart() {
+                debugLog("Orphaned virtual displays detected from previous crash, restarting to clean up...")
+                // Only restart once — if the orphan persists after the restart,
+                // it's from a different process and we can't clean it. Log and
+                // continue normally instead of looping.
+                markCleanupRestart()
+                relaunchApp()
+                return
+            } else {
+                debugLog("Orphaned virtual displays persist after cleanup restart — ignoring (from crashed previous process)")
+            }
         }
 
         // Check for existing virtual display and mirror state
@@ -1040,9 +1047,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !isActive && wasDisconnected && realMonitor != nil {
             let failCount = UserDefaults.standard.integer(forKey: kMirrorFailureCountKey)
             guard failCount < maxMirrorRetries else { return }
-            guard UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) else {
-                debugLog("Auto-apply disabled — skipping reconnect")
-                return
+            // Auto-recover checkmark: if wasDisconnected is true and the monitor
+            // matches, the user clearly had HiDPI enabled before. The checkmark
+            // state may have been lost across an app restart while the monitor
+            // was connected (kHiDPIEnabledKey defaults to false).
+            if !UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) {
+                if connectedMonitorMatchesSavedPreset() {
+                    debugLog("Auto-recovering checkmark — wasDisconnected + monitor match")
+                    UserDefaults.standard.set(true, forKey: kHiDPIEnabledKey)
+                } else {
+                    debugLog("Checkmark off, monitor mismatch — skipping reconnect")
+                    return
+                }
             }
             if !connectedMonitorMatchesSavedPreset() {
                 debugLog("Monitor mismatch — skipping auto-restore on reconnect")
@@ -1077,9 +1093,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let manager = VirtualDisplayManager.shared()
 
             // If user explicitly disabled HiDPI, don't restore on wake
-            guard UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) else {
-                debugLog("Wake: HiDPI disabled — skipping restore")
-                return
+            // If wasDisconnected and monitor matches, auto-recover checkmark
+            if !UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) {
+                if self.wasDisconnected, let _ = self.findRealPhysicalMonitor(),
+                   self.connectedMonitorMatchesSavedPreset() {
+                    debugLog("Wake: auto-recovering checkmark")
+                    UserDefaults.standard.set(true, forKey: kHiDPIEnabledKey)
+                } else {
+                    debugLog("Wake: HiDPI disabled — skipping restore")
+                    return
+                }
             }
 
             // Mirror survived sleep intact
@@ -1242,7 +1265,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Case 2: Reconnect
         if !isActive && wasDisconnected {
             guard let _ = findRealPhysicalMonitor() else { return }
-            guard UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) else { return }
+            // Auto-recover checkmark if wasDisconnected and monitor matches
+            if !UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) {
+                if connectedMonitorMatchesSavedPreset() {
+                    debugLog("DisplayChange: auto-recovering checkmark")
+                    UserDefaults.standard.set(true, forKey: kHiDPIEnabledKey)
+                } else {
+                    debugLog("DisplayChange: checkmark off, monitor mismatch — skipping")
+                    return
+                }
+            }
             guard connectedMonitorMatchesSavedPreset() else { return }
             debugLog("Display reconfiguration: monitor reconnected, reestablishing mirror")
             wasDisconnected = false
@@ -1251,8 +1283,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setupGeneration += 1
             let generation = setupGeneration
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                guard let self = self, generation == self.setupGeneration else { return }
                 autoreleasepool {
-                    self?.reestablishMirrorOnExistingDisplay(generation: generation)
+                    self.reestablishMirrorOnExistingDisplay(generation: generation)
                 }
             }
             return
@@ -1448,8 +1481,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(true, forKey: kAutoRestoreKey)
         }
 
-        // If we restarted after disconnect (not explicit disable), wait for monitor
+        // If we restarted after disconnect AND the monitor is still/missing:
+        // - Monitor absent → wait for reconnect (periodicCheck/handleDisplayConfig will fire)
+        // - Monitor present + fingerprint matches → restore now (the "reconnect" already happened)
         if wasDisconnected {
+            if findExternalDisplay() != nil,
+               connectedMonitorMatchesSavedPreset() {
+                debugLog("Restarted after disconnect but monitor is already connected — restoring now")
+                wasDisconnected = false
+                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+                // Restore the checkmark — user clearly wanted HiDPI before the restart
+                UserDefaults.standard.set(true, forKey: kHiDPIEnabledKey)
+                // Restore with the saved preset
+                if let lastPreset = UserDefaults.standard.string(forKey: kLastPresetKey),
+                   !lastPreset.isEmpty {
+                    isSettingUp = true
+                    setupGeneration += 1
+                    let generation = setupGeneration
+                    if VirtualDisplayManager.shared().displayExists {
+                        // Display survived the restart — just re-mirror it
+                        debugLog("Display exists from previous session, re-mirroring")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                            guard let self = self, generation == self.setupGeneration else { return }
+                            self.reestablishMirrorOnExistingDisplay(generation: generation)
+                        }
+                    } else {
+                        // No display — create fresh
+                        debugLog("No existing display, restoring preset \(lastPreset)")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                            guard let self = self, generation == self.setupGeneration else { return }
+                            self.restorePreset(lastPreset)
+                        }
+                    }
+                }
+                return
+            }
             debugLog("Restarted after disconnect — waiting for monitor reconnection")
             return
         }
