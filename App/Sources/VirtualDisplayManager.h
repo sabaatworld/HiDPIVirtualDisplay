@@ -67,6 +67,25 @@ NS_ASSUME_NONNULL_BEGIN
 /// Destroy all virtual displays created by this manager
 - (void)destroyAllVirtualDisplays;
 
+/// Whether a CGVirtualDisplay is currently held (may be mirrored or not).
+@property (nonatomic, readonly) BOOL displayExists;
+
+/// The framebuffer dimensions of the currently-held display.
+/// Reads from the descriptor (which reflects what was requested at creation),
+/// not the current mode (which macOS can flip to 1x asynchronously).
+@property (nonatomic, readonly) unsigned int maxPixelsWide;
+@property (nonatomic, readonly) unsigned int maxPixelsHigh;
+
+/// Apply new mode settings to the existing display without destroying it.
+/// Preserves the CGDirectDisplayID. Returns NO if no display is active.
+- (BOOL)applyModeToCurrentDisplayWithWidth:(unsigned int)width
+                                    height:(unsigned int)height
+                               refreshRate:(double)refreshRate;
+
+/// Break all mirror sets involving our virtual display. Does NOT release
+/// the CGVirtualDisplay — it stays alive and its displayID remains valid.
+- (void)unmirrorAndDeactivate;
+
 /// Reset all display mirroring configurations
 /// This stops mirroring on all non-builtin displays
 - (void)resetAllMirroring;

@@ -136,6 +136,18 @@ static void retainWindowIfNeeded(NSWindow *window) {
     return _currentDisplayID;
 }
 
+- (BOOL)displayExists {
+    return _currentDisplayID != kCGNullDirectDisplay && _display != nil;
+}
+
+- (unsigned int)maxPixelsWide {
+    return _descriptor ? _descriptor.maxPixelsWide : 0;
+}
+
+- (unsigned int)maxPixelsHigh {
+    return _descriptor ? _descriptor.maxPixelsHigh : 0;
+}
+
 // Internal creation method that accepts explicit color primaries.
 // Both public create methods delegate to this.
 - (CGDirectDisplayID)_createDisplayInternalWithWidth:(unsigned int)width
@@ -489,6 +501,98 @@ static void VDMRestorePinnedMode(CGDirectDisplayID displayID, CGDisplayModeRef m
 - (void)destroyAllVirtualDisplays {
     NSLog(@"VDM: destroyAllVirtualDisplays called");
     [self releaseDisplayObjects];
+}
+
+- (void)unmirrorAndDeactivate {
+    NSLog(@"VDM: unmirrorAndDeactivate called — breaking mirrors, keeping display alive");
+    [self resetAllMirroring];
+    // Deliberately do NOT call releaseDisplayObjects.
+    // The CGVirtualDisplay stays alive so its displayID remains valid.
+    NSLog(@"VDM: unmirrorAndDeactivate complete — display %u still held", _currentDisplayID);
+}
+
+- (BOOL)applyModeToCurrentDisplayWithWidth:(unsigned int)width
+                                    height:(unsigned int)height
+                               refreshRate:(double)refreshRate {
+    if (!_display || _currentDisplayID == kCGNullDirectDisplay) {
+        NSLog(@"VDM: applyModeToCurrentDisplay — no active display");
+        return NO;
+    }
+
+    unsigned int modeWidth = _settings.hiDPI ? width / 2 : width;
+    unsigned int modeHeight = _settings.hiDPI ? height / 2 : height;
+
+    CGVirtualDisplayMode *newMode = [[CGVirtualDisplayMode alloc] initWithWidth:modeWidth
+                                                                         height:modeHeight
+                                                                    refreshRate:refreshRate];
+    if (!newMode) {
+        NSLog(@"VDM: ERROR — failed to create new mode");
+        return NO;
+    }
+
+    // Build new settings with the new mode, preserving HiDPI
+    CGVirtualDisplaySettings *newSettings = [[CGVirtualDisplaySettings alloc] init];
+    newSettings.hiDPI = _settings.hiDPI;
+    id _Nonnull objs[] = { newMode };
+    NSArray *newModesArray = [[NSArray alloc] initWithObjects:objs count:1];
+    newSettings.modes = newModesArray;
+
+    NSLog(@"VDM: applyModeToCurrentDisplay — applying %ux%u @ %.1f Hz to display %u",
+          modeWidth, modeHeight, refreshRate, _currentDisplayID);
+
+    // Step 1: Republish the mode list
+    BOOL applied = [_display applySettings:newSettings];
+    if (!applied) {
+        NSLog(@"VDM: ERROR — applySettings failed");
+        [newMode release];
+        [newSettings release];
+        [newModesArray release];
+        return NO;
+    }
+
+    // Step 2: Switch the active mode (applySettings republishes but doesn't switch).
+    // Track whether we found and switched to the target mode.
+    BOOL modeSwitched = NO;
+    CGDisplayConfigRef config;
+    if (CGBeginDisplayConfiguration(&config) == kCGErrorSuccess) {
+        NSDictionary *opts = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
+        CFArrayRef modes = CGDisplayCopyAllDisplayModes(_currentDisplayID, (__bridge CFDictionaryRef)opts);
+        if (modes) {
+            CFIndex count = CFArrayGetCount(modes);
+            for (CFIndex i = 0; i < count; i++) {
+                CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+                if (CGDisplayModeGetWidth(mode) == modeWidth &&
+                    CGDisplayModeGetHeight(mode) == modeHeight &&
+                    fabs(CGDisplayModeGetRefreshRate(mode) - refreshRate) < 0.5) {
+                    CGConfigureDisplayWithDisplayMode(config, _currentDisplayID, mode, NULL);
+                    modeSwitched = YES;
+                    break;
+                }
+            }
+            CFRelease(modes);
+        }
+        if (modeSwitched) {
+            CGError err = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+            NSLog(@"VDM: Mode switch result: %d", err);
+        } else {
+            // No matching mode found — cancel the empty config
+            CGCancelDisplayConfiguration(config);
+            NSLog(@"VDM: WARNING — mode %ux%u @ %.1f Hz not found in display's mode list",
+                  modeWidth, modeHeight, refreshRate);
+        }
+    }
+
+    // Replace retained ivars
+    if (_mode) [_mode release];
+    _mode = newMode;  // already +1 from alloc/init
+    if (_settings) [_settings release];
+    _settings = newSettings;  // already +1 from alloc/init
+    if (_modesArray) [_modesArray release];
+    _modesArray = newModesArray;  // already +1 from alloc/init
+
+    NSLog(@"VDM: applyModeToCurrentDisplay complete — display %u now %ux%u @ %.1f Hz",
+          _currentDisplayID, modeWidth, modeHeight, refreshRate);
+    return YES;
 }
 
 - (void)releaseDisplayObjects {

@@ -666,15 +666,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // State persistence keys
     private let kLastPresetKey = "lastActivePreset"
-    private let kWasCrashKey = "wasRunningWhenCrashed"
-    private let kAutoRestoreKey = "autoRestoreOnCrash"
-    private let kAutoApplyOnConnectKey = "autoApplyOnConnect"
+    private let kAutoRestoreKey = "wasRunningWhenCrashed"  // renamed: controls auto-restore on launch
+    private let kHiDPIEnabledKey = "hiDPIEnabled"  // persistent checkmark
     private let kRefreshRateKey = "customRefreshRate"  // 0.0 = auto-detect
     private let kKeepHDREnabledKey = "keepHDREnabledBeta"  // Beta: keep HDR on the mirror target
     private let kKeepPrimaryDisplayKey = "keepExternalAsMainDisplay"  // Keep the external monitor as the main display (menu bar)
     private let kBoundMonitorVendorKey = "boundMonitorVendor"
     private let kBoundMonitorModelKey = "boundMonitorModel"
     private let kBoundMonitorSerialKey = "boundMonitorSerial"
+
+    /// The preset key that should show a checkmark (from kLastPresetKey).
+    private var checkedPresetKey: String? {
+        guard let preset = UserDefaults.standard.string(forKey: kLastPresetKey),
+              !preset.isEmpty else { return nil }
+        return preset
+    }
 
     // Track if we're waiting for monitor reconnection
     private var wasDisconnected = false
@@ -709,11 +715,120 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var screenSleepObserver: Any?
     private var screenWakeObserver: Any?
 
+    // Enforcement timers (new)
+    private var modeEnforcementTimer: Timer?       // 2s — re-asserts HiDPI mode
+    private var arrangementObserverTimer: Timer?    // 2s — observe user drags
+    private var lastSavedOrigin: CGPoint?           // last origin written to UserDefaults
+
+    /// Stop all enforcement/observer timers. Full implementation in Task 11.
+    /// Declared here so Tasks 7 and 9 can call it (compilation dependency).
+    func stopEnforcementTimers() {
+        modeEnforcementTimer?.invalidate()
+        modeEnforcementTimer = nil
+        arrangementObserverTimer?.invalidate()
+        arrangementObserverTimer = nil
+    }
+
     // Screens are asleep (display sleep, not system sleep). The G9 drops off
     // the display list for the whole time the panel is dark, which is not a
     // disconnect. While this is set, disconnect handling is deferred; the
     // wake/display-change handlers repair the mirror when the screens return.
     private var screensAsleep = false
+
+    // MARK: - Enforcement Timers
+
+    /// One-shot: position the standalone virtual display at the saved arrangement.
+    /// MUST be called while the display is NOT mirrored — CGConfigureDisplayOrigin
+    /// Start observer and mode enforcement timers after mirror is established.
+    /// Active enforcement (CGConfigureDisplayOrigin) is handled by the 2/5/8s
+    /// retry logic in performMirror — it cannot be a continuous timer because
+    /// CGConfigureDisplayOrigin doesn't work on mirrored displays per Apple docs.
+    func startEnforcementTimers(virtualID: CGDirectDisplayID) {
+        stopEnforcementTimers()
+
+        // Passive observer: saves arrangement when user drags the mirror set
+        // in System Settings, so the position survives future recreates.
+        startArrangementObserver(virtualID: virtualID)
+
+        // --- Mode enforcement: 2s repeating ---
+        modeEnforcementTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isActive else { return }
+            self.enforceHiDPIMode()
+        }
+    }
+
+    func startArrangementObserver(virtualID: CGDirectDisplayID) {
+        arrangementObserverTimer?.invalidate()
+        lastSavedOrigin = DisplayArrangementManager.savedOrigin()
+        debugLog("Arrangement: observer started, baseline=(\(lastSavedOrigin.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nil"))")
+        arrangementObserverTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isActive else { return }
+            let origin = CGDisplayBounds(virtualID).origin
+            if origin != self.lastSavedOrigin {
+                debugLog("Arrangement: user moved — saving (\(Int(origin.x)), \(Int(origin.y))) (was \(self.lastSavedOrigin.map { "\(Int($0.x)),\(Int($0.y))" } ?? "nil"))")
+                DisplayArrangementManager.save(displayID: virtualID)
+                self.lastSavedOrigin = origin
+            }
+        }
+    }
+
+    /// NOTE: stopEnforcementTimers() is already defined earlier as a stub.
+    /// This full implementation replaces it. The earlier stub is functionally
+    /// identical — it already invalidates all three timers.
+
+    /// Enforce the HiDPI mode on the virtual display. Called by the 2s timer.
+    /// Follows opendisplay's selectHiDPIMode() pattern.
+    func enforceHiDPIMode() {
+        let manager = VirtualDisplayManager.shared()
+        guard manager.displayExists else { return }
+        let displayID = manager.currentDisplayID
+
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        guard let modeList = CGDisplayCopyAllDisplayModes(displayID, opts) else { return }
+        let modes = modeList as [AnyObject]
+        // Note: CGDisplayCopyAllDisplayModes returns a CFArray; modes are
+        // CGDisplayModeRefs owned by the array. In Swift, CGDisplayMode
+        // objects are ARC-managed, so no manual release is needed.
+
+        // Find the HiDPI mode: pixelWidth == 2 * width
+        guard let currentMode = CGDisplayCopyDisplayMode(displayID) else {
+            // Can't read current mode — re-apply settings to republish
+            if let presetName = UserDefaults.standard.string(forKey: kLastPresetKey),
+               let config = presetConfigs[presetName] {
+                let rate = getDisplayRefreshRate(findExternalDisplay() ?? 0)
+                manager.applyModeToCurrentDisplay(withWidth: config.width, height: config.height, refreshRate: rate)
+            }
+            return
+        }
+
+        let curW = currentMode.width
+        let curPW = currentMode.pixelWidth
+
+        // Already in a HiDPI mode (pixelWidth == 2 * width): nothing to do
+        if curPW == curW * 2 { return }
+
+        // Find and select a HiDPI mode
+        for case let mode as CGDisplayMode in modes {
+            if mode.pixelWidth == mode.width * 2 {
+                var config: CGDisplayConfigRef?
+                guard CGBeginDisplayConfiguration(&config) == .success else { continue }
+                CGConfigureDisplayWithDisplayMode(config, displayID, mode, nil)
+                CGCompleteDisplayConfiguration(config, .forSession)
+                debugLog("Mode enforcement: re-selected HiDPI mode \(mode.width)x\(mode.height)@2x")
+                return
+            }
+        }
+        // Note: CGDisplayCopyAllDisplayModes modes are ARC-managed in Swift;
+        // the array and its modes are released when the array goes out of scope.
+
+        // No HiDPI mode found — re-publish via applySettings
+        debugLog("Mode enforcement: no @2x mode found, re-publishing")
+        if let presetName = UserDefaults.standard.string(forKey: kLastPresetKey),
+           let config = presetConfigs[presetName] {
+            let rate = getDisplayRefreshRate(findExternalDisplay() ?? 0)
+            manager.applyModeToCurrentDisplay(withWidth: config.width, height: config.height, refreshRate: rate)
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Single-instance guard: launchd RunAtLoad plus a manual open (or a
@@ -772,17 +887,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Check for existing virtual display
+        // Check for existing virtual display and mirror state
         checkCurrentState()
 
-        // Check if we should auto-restore after a crash OR after disconnect restart
+        // Resolve launch state for menu:
+        // 1. Active mirror found → Active (restore preset name from current mode)
+        // 2. No mirror, kLastPresetKey set → Ready
+        // 3. No mirror, no kLastPresetKey → Fresh
+        if isActive && currentPresetName.isEmpty,
+           let savedPreset = UserDefaults.standard.string(forKey: kLastPresetKey) {
+            currentPresetName = savedPreset
+        }
+
+        // Check if we should auto-restore after crash or disconnect restart
         checkAndRestoreFromCrash()
 
-        // Build menu
+        // Build menu with correct initial state
         rebuildMenu()
 
         // Mark that the app is running (for crash detection)
-        UserDefaults.standard.set(true, forKey: kWasCrashKey)
+        UserDefaults.standard.set(true, forKey: kAutoRestoreKey)
 
         // Start monitoring for display changes (disconnect detection)
         startDisplayChangeMonitoring()
@@ -897,8 +1021,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Case 1: HiDPI active but monitor disconnected
         if isActive && realMonitor == nil {
-            debugLog(">>> Periodic check: Physical monitor gone - confirming before cleanup")
-            scheduleDisconnectConfirmation()
+            if screensAsleep || isSettingUp || isRestarting { return }
+            if !disconnectConfirmationPending {
+                scheduleDisconnectConfirmation()
+            }
             return
         }
 
@@ -910,55 +1036,88 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Case 2: HiDPI not active, monitor reconnected, auto-apply enabled
+        // Case 2: Reconnect — was disconnected, monitor returned
         if !isActive && wasDisconnected && realMonitor != nil {
             let failCount = UserDefaults.standard.integer(forKey: kMirrorFailureCountKey)
-            if failCount >= maxMirrorRetries {
-                debugLog(">>> Periodic check: Monitor present but mirror failed \(failCount) times, not retrying (apply manually from menu)")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+            guard failCount < maxMirrorRetries else { return }
+            guard UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) else {
+                debugLog("Auto-apply disabled — skipping reconnect")
                 return
             }
-
-            let autoApply = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey)
-            if autoApply, let lastPreset = UserDefaults.standard.string(forKey: kLastPresetKey), !lastPreset.isEmpty {
-                if !connectedMonitorMatchesSavedPreset() {
-                    debugLog(">>> Periodic check: Monitor present but doesn't match saved preset — skipping auto-apply")
-                    return
-                }
-                debugLog(">>> Periodic check: Monitor reconnected - auto-applying \(lastPreset)")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-                restorePreset(lastPreset)
+            if !connectedMonitorMatchesSavedPreset() {
+                debugLog("Monitor mismatch — skipping auto-restore on reconnect")
+                return
             }
+            debugLog("Monitor reconnected, reestablishing mirror")
+            wasDisconnected = false
+            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+            isSettingUp = true
+            setupGeneration += 1
+            let generation = setupGeneration
+            StatusWindowController.shared.show(message: "Reconnecting...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                autoreleasepool {
+                    self?.reestablishMirrorOnExistingDisplay(generation: generation)
+                }
+            }
+            return
         }
     }
 
     func handleWakeFromSleep() {
-        // Don't restore during setup
-        if isSettingUp || isRestarting {
-            debugLog("Wake: Setup/restart in progress, skipping restore")
-            return
-        }
+        debugLog(">>> System woke from sleep")
 
-        // Check if we have a saved preset to restore
-        guard let lastPreset = UserDefaults.standard.string(forKey: kLastPresetKey), !lastPreset.isEmpty else {
-            debugLog("Wake: No saved preset to restore")
-            return
-        }
-
-        debugLog(">>> Wake: assessing display state before deciding on restore")
-
-        // Mark as setting up to prevent other handlers from interfering
-        isSettingUp = true
-        setupGeneration += 1
-        let generation = setupGeneration
-
-        // Delay assessment to let the display system wake up, then decide the
-        // LEAST destructive action. Destroying the virtual display evicts every
-        // window living on it, which is why windows used to shuffle after sleep.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            self?.assessDisplayStateAfterWake(preset: lastPreset, attempt: 1, generation: generation)
+            guard let self = self else { return }
+            guard !self.isSettingUp, !self.isRestarting else {
+                debugLog("Skipping wake assessment — already setting up or restarting")
+                return
+            }
+
+            let manager = VirtualDisplayManager.shared()
+
+            // If user explicitly disabled HiDPI, don't restore on wake
+            guard UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) else {
+                debugLog("Wake: HiDPI disabled — skipping restore")
+                return
+            }
+
+            // Mirror survived sleep intact
+            if self.isActive && manager.displayExists {
+                if let ext = self.findExternalDisplay(),
+                   CGDisplayMirrorsDisplay(ext) == self.currentVirtualID {
+                    debugLog("Mirror survived wake intact — touching nothing")
+                    return
+                }
+                // Virtual is alive but mirror severed — reattach
+                debugLog("Mirror severed during sleep — reestablishing")
+                self.isSettingUp = true
+                self.setupGeneration += 1
+                let gen = self.setupGeneration
+                self.reestablishMirrorOnExistingDisplay(generation: gen)
+                return
+            }
+
+            // wasDisconnected — try to restore if monitor is back
+            if self.wasDisconnected, let _ = self.findRealPhysicalMonitor() {
+                if self.connectedMonitorMatchesSavedPreset() {
+                    self.wasDisconnected = false
+                    UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+                    self.isSettingUp = true
+                    self.setupGeneration += 1
+                    let gen = self.setupGeneration
+                    self.reestablishMirrorOnExistingDisplay(generation: gen)
+                }
+                return
+            }
+
+            // No virtual display at all — restore from preset
+            if !manager.displayExists,
+               let preset = UserDefaults.standard.string(forKey: kLastPresetKey),
+               !preset.isEmpty,
+               UserDefaults.standard.bool(forKey: kAutoRestoreKey) {
+                self.assessDisplayStateAfterWake(preset: preset, attempt: 1, generation: self.setupGeneration)
+            }
         }
     }
 
@@ -1068,67 +1227,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Case 1: HiDPI is active, check if physical monitor was disconnected
+        // Case 1
         if isActive && currentVirtualID != 0 {
-            // Only check if the real physical monitor is still connected
-            // Don't check mirroring status - macOS can break mirroring unexpectedly
-            let realMonitor = findRealPhysicalMonitor(verbose: true)
-
+            let realMonitor = findRealPhysicalMonitor()
             if realMonitor == nil {
-                debugLog("Physical monitor not found - confirming before cleanup")
                 scheduleDisconnectConfirmation()
                 return
-            } else {
-                debugLog("Physical monitor still connected: \(realMonitor!)")
-                // Sleep or a transient dropout may have severed just the
-                // mirror (e.g. the monitor enumerated after the wake
-                // assessment gave up). Repair in place; no-op when intact.
-                ensureMirrorIntact()
             }
+            // Monitor present — ensure mirror is intact
+            ensureMirrorIntact()
             return
         }
 
-        // Case 2: HiDPI is not active, check if monitor was reconnected
-        let realMonitor = findRealPhysicalMonitor(verbose: true)
-        if !isActive && realMonitor != nil && wasDisconnected {
-            let failCount = UserDefaults.standard.integer(forKey: kMirrorFailureCountKey)
-            if failCount >= maxMirrorRetries {
-                debugLog("Display reconnected but mirror failed \(failCount) times, not retrying (apply manually from menu)")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-                return
-            }
-
-            debugLog("External display reconnected")
-
-            let autoApply = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey)
-            if autoApply, let lastPreset = UserDefaults.standard.string(forKey: kLastPresetKey), !lastPreset.isEmpty {
-                if !connectedMonitorMatchesSavedPreset() {
-                    debugLog("Display reconnected but doesn't match saved preset — skipping auto-apply")
-                    wasDisconnected = false
-                    UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-                    return
+        // Case 2: Reconnect
+        if !isActive && wasDisconnected {
+            guard let _ = findRealPhysicalMonitor() else { return }
+            guard UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) else { return }
+            guard connectedMonitorMatchesSavedPreset() else { return }
+            debugLog("Display reconfiguration: monitor reconnected, reestablishing mirror")
+            wasDisconnected = false
+            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+            isSettingUp = true
+            setupGeneration += 1
+            let generation = setupGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                autoreleasepool {
+                    self?.reestablishMirrorOnExistingDisplay(generation: generation)
                 }
-                debugLog("Auto-applying last preset: \(lastPreset)")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-
-                // Delay to let the display settle. Generation-guarded so a
-                // manual apply during the delay isn't clobbered by this
-                // stale reconnect restore.
-                let generation = setupGeneration
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                    guard let self = self, generation == self.setupGeneration else {
-                        debugLog("Reconnect restore superseded by newer action, skipping")
-                        return
-                    }
-                    self.restorePreset(lastPreset)
-                }
-            } else {
-                debugLog("Auto-apply disabled or no saved preset")
-                wasDisconnected = false
-                UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
             }
+            return
         }
     }
 
@@ -1182,10 +1309,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var displayCount: UInt32 = 0
         CGGetOnlineDisplayList(32, &displayList, &displayCount)
 
+        let managedID = VirtualDisplayManager.shared().currentDisplayID
         for i in 0..<Int(displayCount) {
             let displayID = displayList[i]
-            // Skip the display we currently own — it's not orphaned
-            if currentVirtualID != 0 && displayID == currentVirtualID { continue }
+            // Skip displays we currently own — they're not orphaned
+            if displayID == currentVirtualID || (managedID != kCGNullDirectDisplay && displayID == managedID) {
+                continue
+            }
             let vendorID = CGDisplayVendorNumber(displayID)
             // Our virtual displays use vendor ID 0x1234 (4660 decimal)
             if vendorID == 0x1234 {
@@ -1204,72 +1334,62 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// gone across several checks before cleaning up. If it comes back, just
     /// repair the mirror in place.
     func scheduleDisconnectConfirmation() {
-        if disconnectConfirmationPending || isSettingUp || isRestarting { return }
-        if screensAsleep {
-            debugLog("Monitor gone but screens are asleep — not a disconnect, deferring")
-            return
-        }
+        if disconnectConfirmationPending { return }
+        if isSettingUp || isRestarting { return }
+        if screensAsleep { return }  // Panel dark = not an unplug
         disconnectConfirmationPending = true
-        debugLog("Disconnect suspected — re-checking for \(3 * 4)s before tearing down")
+        debugLog("Scheduling disconnect confirmation...")
         confirmDisconnect(attempt: 1)
     }
 
     private func confirmDisconnect(attempt: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+        let delay: Double = 4.0
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self = self else { return }
+
+            // Abort if we're setting up, restarting, or screens are asleep
             if self.isSettingUp || self.isRestarting || self.screensAsleep {
                 self.disconnectConfirmationPending = false
                 return
             }
-            if self.findRealPhysicalMonitor() != nil {
+
+            // Check if monitor is back
+            if let realMonitor = self.findRealPhysicalMonitor() {
                 self.disconnectConfirmationPending = false
-                debugLog("Monitor is back (transient dropout) — verifying mirror instead of cleaning up")
-                if self.isActive && !self.ensureMirrorIntact() {
-                    // Virtual display didn't survive the dropout — full restore.
-                    if let preset = UserDefaults.standard.string(forKey: self.kLastPresetKey), !preset.isEmpty {
-                        debugLog("Mirror unrecoverable after dropout — rebuilding")
-                        UserDefaults.standard.set(0, forKey: self.kMirrorFailureCountKey)
-                        self.isSettingUp = true
-                        self.setupGeneration += 1
-                        self.restorePreset(preset)
+                debugLog("Disconnect confirmation: monitor \(realMonitor) reappeared (transient dropout)")
+                if self.isActive {
+                    // Mirror may have been severed by the transient dropout — repair it
+                    self.ensureMirrorIntact()
+                }
+                // If mirror was severed and unrecoverable, reestablish from scratch
+                if !self.isActive || self.wasDisconnected {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.setupGeneration += 1
+                        self?.isSettingUp = true
+                        self?.reestablishMirrorOnExistingDisplay(generation: self?.setupGeneration ?? 0)
                     }
                 }
                 return
             }
+
             if attempt < 3 {
-                debugLog("Monitor still gone (check \(attempt)/3)")
+                debugLog("Disconnect attempt \(attempt)/3 — retrying in \(delay)s")
                 self.confirmDisconnect(attempt: attempt + 1)
-                return
+            } else {
+                // Confirmed disconnect — just un-mirror, keep display alive
+                debugLog(">>> Disconnect confirmed — un-mirroring virtual display")
+                self.disconnectConfirmationPending = false
+                self.wasDisconnected = true
+                UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
+                UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
+
+                let manager = VirtualDisplayManager.shared()
+                manager.unmirrorAndDeactivate()
+                self.isActive = false
+                self.stopEnforcementTimers()
+                self.rebuildMenu()
             }
-            self.disconnectConfirmationPending = false
-            debugLog("Disconnect confirmed after \(attempt) checks - cleaning up")
-            self.wasDisconnected = true
-            UserDefaults.standard.set(0, forKey: self.kMirrorFailureCountKey)  // Reset for reconnection
-            self.cleanupAfterDisconnect()
         }
-    }
-
-    func cleanupAfterDisconnect() {
-        // Re-entrancy guard: a second display-change notification during
-        // cleanup used to spawn a second relaunch (observed in the wild —
-        // two cleanups within one second).
-        if isRestarting {
-            debugLog("Disconnect cleanup already in progress, ignoring")
-            return
-        }
-        isRestarting = true
-        debugLog(">>> Starting disconnect cleanup")
-
-        // Mark that we're disconnected (for auto-restore on reconnect)
-        UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
-
-        // The CGVirtualDisplay framework doesn't actually destroy displays when we release
-        // the object - they persist until the app terminates. The only reliable way to
-        // clean up orphaned virtual displays is to restart the app.
-        debugLog(">>> Restarting app to clean up virtual displays...")
-
-        // Relaunch the app
-        relaunchApp()
     }
 
     private let kWasDisconnectedKey = "wasDisconnected"
@@ -1311,29 +1431,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         FileManager.default.createFile(atPath: cleanupMarkerPath, contents: nil)
     }
 
-    // Disable HiDPI when monitor is disconnected - preserves preset for auto-restore
-    func disableHiDPIForDisconnect() {
-        debugLog("Disabling HiDPI for disconnect (preserving preset) - currentVirtualID: \(currentVirtualID)")
-        setupGeneration += 1  // Cancel any in-flight setup steps
-        isSettingUp = false   // A cancelled setup step won't clear this itself
-
-        let manager = VirtualDisplayManager.shared()
-
-        // Reset ALL mirroring to ensure clean state
-        manager.resetAllMirroring()
-
-        // Destroy our virtual display
-        manager.destroyAllVirtualDisplays()
-
-        currentVirtualID = 0
-        targetExternalDisplayID = 0
-        isActive = false
-        currentPresetName = ""
-
-        // DO NOT clear saved preset - we want to restore it when monitor reconnects
-        debugLog("HiDPI disabled (preset preserved for reconnection)")
-    }
-
     // NOTE: earlier versions force-moved every window of every app to
     // {100,100} via System Events AppleScript whenever the display went away.
     // That erased macOS's own per-display window layout memory, so windows
@@ -1343,7 +1440,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // let it.
 
     func checkAndRestoreFromCrash() {
-        let wasRunning = UserDefaults.standard.bool(forKey: kWasCrashKey)
+        let wasRunning = UserDefaults.standard.bool(forKey: kAutoRestoreKey)
         let autoRestore = UserDefaults.standard.bool(forKey: kAutoRestoreKey)
 
         // Default to auto-restore enabled
@@ -1351,15 +1448,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(true, forKey: kAutoRestoreKey)
         }
 
-        // Default to auto-apply on reconnect enabled
-        if UserDefaults.standard.object(forKey: kAutoApplyOnConnectKey) == nil {
-            UserDefaults.standard.set(true, forKey: kAutoApplyOnConnectKey)
+        // If we restarted after disconnect (not explicit disable), wait for monitor
+        if wasDisconnected {
+            debugLog("Restarted after disconnect — waiting for monitor reconnection")
+            return
         }
 
-        // If we restarted after disconnect (not crash), don't try to restore here
-        // Let the reconnect detection handle it when monitor is plugged back in
-        if wasDisconnected {
-            debugLog("Restarted after disconnect - waiting for monitor reconnection")
+        // If user explicitly disabled HiDPI (checkmark off), never auto-restore
+        if !UserDefaults.standard.bool(forKey: kHiDPIEnabledKey) {
+            debugLog("HiDPI disabled by user — skipping auto-restore")
+            return
+        }
+
+        // If auto-restore after crash is disabled, don't auto-restore
+        if !UserDefaults.standard.bool(forKey: kAutoRestoreKey) {
+            debugLog("Auto-restore disabled by user — skipping")
             return
         }
 
@@ -1393,7 +1496,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Clear the crash flag (will be set again when app is running)
-        UserDefaults.standard.set(false, forKey: kWasCrashKey)
+        UserDefaults.standard.set(false, forKey: kAutoRestoreKey)
     }
 
     // Map old preset names to new ones for backwards compatibility
@@ -1429,15 +1532,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                   let hiDPI = dict["hiDPI"] as? Bool {
             config = PresetConfig(name: name, width: width, height: height, logicalWidth: logicalWidth, logicalHeight: logicalHeight, ppi: ppi, hiDPI: hiDPI)
         } else {
-            debugLog("ERROR: Unknown preset for restore: \(presetName) (migrated: \(migratedName))")
-            // Callers (e.g. the wake path) may have set isSettingUp before
-            // calling us — clear it or disconnect/reconnect handling stays
-            // disabled until the next app restart.
+            debugLog("ERROR: Unknown preset for restore: \(presetName)")
             isSettingUp = false
             return
         }
 
-        // Update saved preset to new name if migrated
         if migratedName != presetName {
             debugLog("Migrated preset name: \(presetName) -> \(migratedName)")
             saveCurrentPreset(migratedName)
@@ -1445,7 +1544,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         debugLog(">>> Auto-restoring preset: \(presetName)")
 
-        // Mark that we're setting up (don't trigger cleanup during setup)
         isSettingUp = true
         setupGeneration += 1
         let generation = setupGeneration
@@ -1454,47 +1552,60 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let manager = VirtualDisplayManager.shared()
         manager.resetAllMirroring()
-        manager.destroyAllVirtualDisplays()
+        stopEnforcementTimers()
+        if manager.displayExists {
+            manager.destroyAllVirtualDisplays()
+        }
         currentVirtualID = 0
         isActive = false
         currentPresetName = ""
 
-        // Schedule creation
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             autoreleasepool {
                 self?.createVirtualDisplayAsync(config: config, generation: generation)
             }
         }
 
-        // Re-save the preset since we're using it
         saveCurrentPreset(presetName)
     }
 
     func saveCurrentPreset(_ presetName: String) {
         UserDefaults.standard.set(presetName, forKey: kLastPresetKey)
-        UserDefaults.standard.set(true, forKey: kWasCrashKey)
+        UserDefaults.standard.set(true, forKey: kAutoRestoreKey)
         debugLog("Saved preset for crash recovery: \(presetName)")
     }
 
     func clearSavedPreset() {
         UserDefaults.standard.removeObject(forKey: kLastPresetKey)
-        UserDefaults.standard.set(false, forKey: kWasCrashKey)
+        UserDefaults.standard.set(false, forKey: kAutoRestoreKey)
         debugLog("Cleared saved preset")
+    }
+
+    /// Save the preset for menu checkmark only — does NOT enable auto-restore.
+    /// Used when user selects a preset while HiDPI is off (Ready state).
+    func saveCheckmarkPreset(_ presetName: String) {
+        UserDefaults.standard.set(presetName, forKey: kLastPresetKey)
+        debugLog("Saved checkmark preset: \(presetName)")
     }
 
     func cleanupStaleState() {
         debugLog("Cleaning up stale display state...")
         let manager = VirtualDisplayManager.shared()
 
-        // Check if we have an external display connected
         let hasExternalDisplay = findExternalDisplay() != nil
         debugLog("External display connected: \(hasExternalDisplay)")
 
-        // Reset any existing mirroring that might be left over
-        manager.resetAllMirroring()
-
-        // Destroy any virtual displays from previous session
-        manager.destroyAllVirtualDisplays()
+        // Only reset mirroring — do NOT destroy virtual displays that survived
+        // from a previous session of THIS process (they're still valid).
+        // Orphans from a DIFFERENT (crashed) process are handled before we
+        // get here by the relaunch guard in applicationDidFinishLaunching.
+        if manager.displayExists {
+            debugLog("Virtual display \(manager.currentDisplayID) survived from previous session — un-mirroring")
+            manager.resetAllMirroring()
+        } else {
+            // No live display — just clean up any leftover mirror configs
+            manager.resetAllMirroring()
+        }
 
         debugLog("Stale state cleanup complete")
     }
@@ -1502,17 +1613,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         debugLog("App terminating - cleaning up...")
 
-        // Stop monitoring
         stopDisplayChangeMonitoring()
+        stopEnforcementTimers()
 
-        // Disable HiDPI but preserve preset for auto-restore on next launch
-        disableHiDPIForDisconnect()
+        let manager = VirtualDisplayManager.shared()
+        if manager.displayExists {
+            DisplayArrangementManager.save(displayID: manager.currentDisplayID)
+        }
+
+        manager.resetAllMirroring()
+        manager.destroyAllVirtualDisplays()
 
         debugLog("Cleanup complete, terminating")
     }
 
     func checkCurrentState() {
-        // Check if there's an active mirror setup
+        currentVirtualID = 0
         var displayList = [CGDirectDisplayID](repeating: 0, count: 32)
         var displayCount: UInt32 = 0
         CGGetOnlineDisplayList(32, &displayList, &displayCount)
@@ -1521,11 +1637,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let displayID = displayList[i]
             let mirrorOf = CGDisplayMirrorsDisplay(displayID)
             if mirrorOf != kCGNullDirectDisplay {
-                // Only claim mirror sets whose master is one of our virtual
-                // displays (vendor 0x1234) — a mirror the user configured
-                // between two of their own displays isn't ours and must not
-                // flip the app to "active".
                 guard CGDisplayVendorNumber(mirrorOf) == 0x1234 else { continue }
+                currentVirtualID = mirrorOf
                 if let mode = CGDisplayCopyDisplayMode(mirrorOf) {
                     let width = mode.width
                     let height = mode.height
@@ -1536,45 +1649,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 break
             }
         }
+
+        // Also check if VirtualDisplayManager already holds a display
+        // (survived from a previous run of this process)
+        let manager = VirtualDisplayManager.shared()
+        if !isActive && manager.displayExists {
+            currentVirtualID = manager.currentDisplayID
+            debugLog("Found existing virtual display (un-mirrored): \(currentVirtualID)")
+        }
+
+        debugLog("Launch state: isActive=\(isActive), displayExists=\(manager.displayExists), preset=\(currentPresetName)")
     }
 
     func rebuildMenu() {
         let menu = NSMenu()
+        let hasPreset = checkedPresetKey != nil
 
-        // Status header
+        // Determine state for menu layout
+        // Fresh: no preset selected, no HiDPI active
+        // Ready: preset selected, HiDPI not active
+        // Active: HiDPI active
+
+        // Status header + Enable HiDPI checkmark
+        let hiDPIEnabled = UserDefaults.standard.bool(forKey: kHiDPIEnabledKey)
+        let enableItem = NSMenuItem(title: "Enable HiDPI", action: #selector(toggleHiDPIEnabled(_:)), keyEquivalent: "")
+        enableItem.target = self
+        enableItem.state = hiDPIEnabled ? .on : .off
+        enableItem.isEnabled = hasPreset || isActive  // grayed in Fresh state only
+        menu.addItem(enableItem)
+
         if isActive {
-            let statusItem = NSMenuItem(title: "Active: \(currentPresetName)", action: nil, keyEquivalent: "")
-            statusItem.isEnabled = false
-            menu.addItem(statusItem)
-            menu.addItem(NSMenuItem.separator())
-
-            let disableItem = NSMenuItem(title: "Disable HiDPI", action: #selector(disableHiDPIAction), keyEquivalent: "")
-            disableItem.target = self
-            menu.addItem(disableItem)
-
             let reapplyItem = NSMenuItem(title: "Reapply HiDPI", action: #selector(reapplyHiDPIAction), keyEquivalent: "")
             reapplyItem.target = self
             menu.addItem(reapplyItem)
-
-            menu.addItem(NSMenuItem.separator())
-        } else {
-            let statusItem = NSMenuItem(title: "No HiDPI active", action: nil, keyEquivalent: "")
-            statusItem.isEnabled = false
-            menu.addItem(statusItem)
-            menu.addItem(NSMenuItem.separator())
         }
+
+        menu.addItem(NSMenuItem.separator())
 
         // Samsung G9 57" (7680x2160) presets - ordered by scale factor (smaller = more space)
         let g9Menu = NSMenu()
-        addPresetItem(to: g9Menu, preset: "g9-57-6144x1728", title: "6144×1728 (1.25x) - More Space")
-        addPresetItem(to: g9Menu, preset: "g9-57-5908x1662", title: "5908×1662 (1.3x)")
-        addPresetItem(to: g9Menu, preset: "g9-57-5632x1584", title: "5632×1584 (1.36x)")
-        addPresetItem(to: g9Menu, preset: "g9-57-5486x1543", title: "5486×1543 (1.4x)")
-        addPresetItem(to: g9Menu, preset: "g9-57-5297x1490", title: "5297×1490 (1.45x)")
-        addPresetItem(to: g9Menu, preset: "g9-57-5120x1440", title: "5120×1440 (1.5x) ★ Recommended")
-        addPresetItem(to: g9Menu, preset: "g9-57-4800x1350", title: "4800×1350 (1.6x)")
-        addPresetItem(to: g9Menu, preset: "g9-57-4389x1234", title: "4389×1234 (1.75x)")
-        addPresetItem(to: g9Menu, preset: "g9-57-3840x1080", title: "3840×1080 (2.0x) - Larger Text")
+        let checkedPreset = checkedPresetKey
+        addPresetItem(to: g9Menu, preset: "g9-57-6144x1728", title: "6144×1728 (1.25x) - More Space", checked: checkedPreset == "g9-57-6144x1728")
+        addPresetItem(to: g9Menu, preset: "g9-57-5908x1662", title: "5908×1662 (1.3x)", checked: checkedPreset == "g9-57-5908x1662")
+        addPresetItem(to: g9Menu, preset: "g9-57-5632x1584", title: "5632×1584 (1.36x)", checked: checkedPreset == "g9-57-5632x1584")
+        addPresetItem(to: g9Menu, preset: "g9-57-5486x1543", title: "5486×1543 (1.4x)", checked: checkedPreset == "g9-57-5486x1543")
+        addPresetItem(to: g9Menu, preset: "g9-57-5297x1490", title: "5297×1490 (1.45x)", checked: checkedPreset == "g9-57-5297x1490")
+        addPresetItem(to: g9Menu, preset: "g9-57-5120x1440", title: "5120×1440 (1.5x) ★ Recommended", checked: checkedPreset == "g9-57-5120x1440")
+        addPresetItem(to: g9Menu, preset: "g9-57-4800x1350", title: "4800×1350 (1.6x)", checked: checkedPreset == "g9-57-4800x1350")
+        addPresetItem(to: g9Menu, preset: "g9-57-4389x1234", title: "4389×1234 (1.75x)", checked: checkedPreset == "g9-57-4389x1234")
+        addPresetItem(to: g9Menu, preset: "g9-57-3840x1080", title: "3840×1080 (2.0x) - Larger Text", checked: checkedPreset == "g9-57-3840x1080")
         addCustomScaleItem(to: g9Menu, nativeWidth: 7680, nativeHeight: 2160, ppi: 140)
 
         let g9Item = NSMenuItem(title: "Samsung G9 57\"", action: nil, keyEquivalent: "")
@@ -1583,12 +1706,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Samsung G9 49" (5120x1440) presets
         let g49Menu = NSMenu()
-        addPresetItem(to: g49Menu, preset: "g9-49-4096x1152", title: "4096×1152 (1.25x) - More Space")
-        addPresetItem(to: g49Menu, preset: "g9-49-3938x1108", title: "3938×1108 (1.3x)")
-        addPresetItem(to: g49Menu, preset: "g9-49-3840x1080", title: "3840×1080 (1.33x) ★ Recommended")
-        addPresetItem(to: g49Menu, preset: "g9-49-3413x960", title: "3413×960 (1.5x)")
-        addPresetItem(to: g49Menu, preset: "g9-49-2926x823", title: "2926×823 (1.75x)")
-        addPresetItem(to: g49Menu, preset: "g9-49-2560x720", title: "2560×720 (2.0x) - Larger Text")
+        addPresetItem(to: g49Menu, preset: "g9-49-4096x1152", title: "4096×1152 (1.25x) - More Space", checked: checkedPreset == "g9-49-4096x1152")
+        addPresetItem(to: g49Menu, preset: "g9-49-3938x1108", title: "3938×1108 (1.3x)", checked: checkedPreset == "g9-49-3938x1108")
+        addPresetItem(to: g49Menu, preset: "g9-49-3840x1080", title: "3840×1080 (1.33x) ★ Recommended", checked: checkedPreset == "g9-49-3840x1080")
+        addPresetItem(to: g49Menu, preset: "g9-49-3413x960", title: "3413×960 (1.5x)", checked: checkedPreset == "g9-49-3413x960")
+        addPresetItem(to: g49Menu, preset: "g9-49-2926x823", title: "2926×823 (1.75x)", checked: checkedPreset == "g9-49-2926x823")
+        addPresetItem(to: g49Menu, preset: "g9-49-2560x720", title: "2560×720 (2.0x) - Larger Text", checked: checkedPreset == "g9-49-2560x720")
         addCustomScaleItem(to: g49Menu, nativeWidth: 5120, nativeHeight: 1440, ppi: 109)
 
         let g49Item = NSMenuItem(title: "Samsung G9 49\"", action: nil, keyEquivalent: "")
@@ -1597,11 +1720,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 34" Ultrawide (3440x1440) presets
         let uwMenu = NSMenu()
-        addPresetItem(to: uwMenu, preset: "uw34-2752x1152", title: "2752×1152 (1.25x) - More Space")
-        addPresetItem(to: uwMenu, preset: "uw34-2646x1108", title: "2646×1108 (1.3x)")
-        addPresetItem(to: uwMenu, preset: "uw34-2293x960", title: "2293×960 (1.5x) ★ Recommended")
-        addPresetItem(to: uwMenu, preset: "uw34-1966x823", title: "1966×823 (1.75x)")
-        addPresetItem(to: uwMenu, preset: "uw34-1720x720", title: "1720×720 (2.0x) - Larger Text")
+        addPresetItem(to: uwMenu, preset: "uw34-2752x1152", title: "2752×1152 (1.25x) - More Space", checked: checkedPreset == "uw34-2752x1152")
+        addPresetItem(to: uwMenu, preset: "uw34-2646x1108", title: "2646×1108 (1.3x)", checked: checkedPreset == "uw34-2646x1108")
+        addPresetItem(to: uwMenu, preset: "uw34-2293x960", title: "2293×960 (1.5x) ★ Recommended", checked: checkedPreset == "uw34-2293x960")
+        addPresetItem(to: uwMenu, preset: "uw34-1966x823", title: "1966×823 (1.75x)", checked: checkedPreset == "uw34-1966x823")
+        addPresetItem(to: uwMenu, preset: "uw34-1720x720", title: "1720×720 (2.0x) - Larger Text", checked: checkedPreset == "uw34-1720x720")
         addCustomScaleItem(to: uwMenu, nativeWidth: 3440, nativeHeight: 1440, ppi: 110)
 
         let uwItem = NSMenuItem(title: "34\" Ultrawide (3440×1440)", action: nil, keyEquivalent: "")
@@ -1610,11 +1733,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 38" Ultrawide (3840x1600) presets
         let uw38Menu = NSMenu()
-        addPresetItem(to: uw38Menu, preset: "uw38-3072x1280", title: "3072×1280 (1.25x) - More Space")
-        addPresetItem(to: uw38Menu, preset: "uw38-2954x1231", title: "2954×1231 (1.3x)")
-        addPresetItem(to: uw38Menu, preset: "uw38-2560x1067", title: "2560×1067 (1.5x) ★ Recommended")
-        addPresetItem(to: uw38Menu, preset: "uw38-2194x914", title: "2194×914 (1.75x)")
-        addPresetItem(to: uw38Menu, preset: "uw38-1920x800", title: "1920×800 (2.0x) - Larger Text")
+        addPresetItem(to: uw38Menu, preset: "uw38-3072x1280", title: "3072×1280 (1.25x) - More Space", checked: checkedPreset == "uw38-3072x1280")
+        addPresetItem(to: uw38Menu, preset: "uw38-2954x1231", title: "2954×1231 (1.3x)", checked: checkedPreset == "uw38-2954x1231")
+        addPresetItem(to: uw38Menu, preset: "uw38-2560x1067", title: "2560×1067 (1.5x) ★ Recommended", checked: checkedPreset == "uw38-2560x1067")
+        addPresetItem(to: uw38Menu, preset: "uw38-2194x914", title: "2194×914 (1.75x)", checked: checkedPreset == "uw38-2194x914")
+        addPresetItem(to: uw38Menu, preset: "uw38-1920x800", title: "1920×800 (2.0x) - Larger Text", checked: checkedPreset == "uw38-1920x800")
         addCustomScaleItem(to: uw38Menu, nativeWidth: 3840, nativeHeight: 1600, ppi: 110)
 
         let uw38Item = NSMenuItem(title: "38\" Ultrawide (3840×1600)", action: nil, keyEquivalent: "")
@@ -1623,11 +1746,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 4K (3840x2160) presets
         let k4Menu = NSMenu()
-        addPresetItem(to: k4Menu, preset: "4k-3072x1728", title: "3072×1728 (1.25x) - More Space")
-        addPresetItem(to: k4Menu, preset: "4k-2954x1662", title: "2954×1662 (1.3x)")
-        addPresetItem(to: k4Menu, preset: "4k-2560x1440", title: "2560×1440 (1.5x) ★ Recommended")
-        addPresetItem(to: k4Menu, preset: "4k-2194x1234", title: "2194×1234 (1.75x)")
-        addPresetItem(to: k4Menu, preset: "4k-1920x1080", title: "1920×1080 (2.0x) - Larger Text")
+        addPresetItem(to: k4Menu, preset: "4k-3072x1728", title: "3072×1728 (1.25x) - More Space", checked: checkedPreset == "4k-3072x1728")
+        addPresetItem(to: k4Menu, preset: "4k-2954x1662", title: "2954×1662 (1.3x)", checked: checkedPreset == "4k-2954x1662")
+        addPresetItem(to: k4Menu, preset: "4k-2560x1440", title: "2560×1440 (1.5x) ★ Recommended", checked: checkedPreset == "4k-2560x1440")
+        addPresetItem(to: k4Menu, preset: "4k-2194x1234", title: "2194×1234 (1.75x)", checked: checkedPreset == "4k-2194x1234")
+        addPresetItem(to: k4Menu, preset: "4k-1920x1080", title: "1920×1080 (2.0x) - Larger Text", checked: checkedPreset == "4k-1920x1080")
         addCustomScaleItem(to: k4Menu, nativeWidth: 3840, nativeHeight: 2160, ppi: 163)
 
         let k4Item = NSMenuItem(title: "4K Displays (3840×2160)", action: nil, keyEquivalent: "")
@@ -1651,11 +1774,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startAtLoginItem.target = self
         startAtLoginItem.state = LaunchAgentManager.shared.isInstalled ? .on : .off
         settingsMenu.addItem(startAtLoginItem)
-
-        let autoApplyItem = NSMenuItem(title: "Auto-Apply on Reconnect", action: #selector(toggleAutoApply(_:)), keyEquivalent: "")
-        autoApplyItem.target = self
-        autoApplyItem.state = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey) ? .on : .off
-        settingsMenu.addItem(autoApplyItem)
 
         let autoRestoreItem = NSMenuItem(title: "Auto-Restore After Crash", action: #selector(toggleAutoRestore(_:)), keyEquivalent: "")
         autoRestoreItem.target = self
@@ -1749,13 +1867,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             alert.addButton(withTitle: "OK")
             alert.runModal()
         }
-    }
-
-    @objc func toggleAutoApply(_ sender: NSMenuItem) {
-        let current = UserDefaults.standard.bool(forKey: kAutoApplyOnConnectKey)
-        UserDefaults.standard.set(!current, forKey: kAutoApplyOnConnectKey)
-        debugLog("Auto-apply on reconnect: \(!current)")
-        rebuildMenu()
     }
 
     @objc func toggleAutoRestore(_ sender: NSMenuItem) {
@@ -1865,6 +1976,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let result = CGCompleteDisplayConfiguration(config, .forSession)
         let ok = result == .success
         debugLog("Primary: set display \(targetID) as main -> \(ok ? "ok" : "failed (\(result.rawValue))")")
+
+        // Save arrangement after primary display promotion
+        if ok, VirtualDisplayManager.shared().displayExists {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                DisplayArrangementManager.save(displayID: VirtualDisplayManager.shared().currentDisplayID)
+            }
+        }
+
         return ok
     }
 
@@ -1892,18 +2011,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(rate.doubleValue, forKey: kRefreshRateKey)
         debugLog("Refresh rate set to: \(rate.doubleValue == 0 ? "Auto" : "\(rate.doubleValue) Hz")")
 
-        // CGVirtualDisplay objects persist until the process exits, so changing
-        // the rate on a live display has no effect — we must relaunch. The saved
-        // preset is already in kLastPresetKey from when it was applied, so
-        // checkAndRestoreFromCrash() will re-apply it with the new rate.
-        if (isActive || hasOrphanedVirtualDisplay()) && oldRate != rate.doubleValue {
-            debugLog("Active display present, relaunching to apply new refresh rate...")
-            isRestarting = true
-            StatusWindowController.shared.show(message: "Applying refresh rate...")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-                relaunchApp()
+        if isActive && oldRate != rate.doubleValue {
+            debugLog("Active display present, applying refresh rate in-process")
+            let manager = VirtualDisplayManager.shared()
+            if manager.displayExists {
+                stopEnforcementTimers()
+                isSettingUp = true
+                setupGeneration += 1
+                let generation = setupGeneration
+                let effectiveRate = rate.doubleValue == 0 ? getDisplayRefreshRate(manager.currentDisplayID) : rate.doubleValue
+                let currentW = manager.maxPixelsWide
+                let currentH = manager.maxPixelsHigh
+                manager.applyModeToCurrentDisplay(withWidth: currentW, height: currentH, refreshRate: effectiveRate)
+                // Re-mirror to apply
+                if let externalID = findExternalDisplay() {
+                    manager.resetAllMirroring()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        guard let self = self, generation == self.setupGeneration else { return }
+                        autoreleasepool {
+                            self.performMirror(virtualID: manager.currentDisplayID, externalID: externalID,
+                                                config: PresetConfig(name: "", width: currentW, height: currentH,
+                                                                     logicalWidth: currentW/2, logicalHeight: currentH/2,
+                                                                     ppi: 140, hiDPI: true),
+                                                generation: generation)
+                        }
+                    }
+                }
             }
-            return
         }
         rebuildMenu()
     }
@@ -1928,10 +2062,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
-    func addPresetItem(to menu: NSMenu, preset: String, title: String) {
+    func addPresetItem(to menu: NSMenu, preset: String, title: String, checked: Bool = false) {
         let item = NSMenuItem(title: title, action: #selector(applyPreset(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = preset
+        item.state = checked ? .on : .off
         menu.addItem(item)
     }
 
@@ -1955,9 +2090,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applyCustomConfig(_ config: PresetConfig) {
-        // User manually applying — reset failure counter for fresh attempt
         UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
-        // Save custom config to UserDefaults for crash recovery
         let presetKey = "custom-\(config.logicalWidth)x\(config.logicalHeight)"
         let customDict: [String: Any] = [
             "name": config.name,
@@ -1969,106 +2102,103 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             "hiDPI": config.hiDPI
         ]
         UserDefaults.standard.set(customDict, forKey: "customPresetConfig")
-        saveCurrentPreset(presetKey)
 
-        // If a virtual display is already active, restart to switch cleanly
-        if isActive || hasOrphanedVirtualDisplay() {
-            debugLog("Active display exists, restarting to apply custom config cleanly...")
-            isRestarting = true
-            StatusWindowController.shared.show(message: "Switching preset...")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-                relaunchApp()
+        if isActive || VirtualDisplayManager.shared().displayExists {
+            // Active: destroy old, create new in-process
+            debugLog("Active display exists, recreating with custom config in-process")
+            let manager = VirtualDisplayManager.shared()
+            stopEnforcementTimers()
+            manager.destroyAllVirtualDisplays()
+            currentVirtualID = 0
+            isActive = false
+            isSettingUp = true
+            setupGeneration += 1
+            let generation = setupGeneration
+            saveCurrentPreset(presetKey)
+            StatusWindowController.shared.show(message: "Switching to custom scale...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                autoreleasepool {
+                    self?.createVirtualDisplayAsync(config: config, generation: generation)
+                }
             }
-            return
-        }
-
-        isSettingUp = true
-        setupGeneration += 1
-        let generation = setupGeneration
-        StatusWindowController.shared.show(message: "Preparing display configuration...")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            autoreleasepool {
-                self?.createVirtualDisplayAsync(config: config, generation: generation)
-            }
+        } else {
+            // Ready/Fresh: just save the checkmark
+            saveCheckmarkPreset(presetKey)
+            rebuildMenu()
+            debugLog("Custom config saved (checkmark only)")
         }
     }
 
     @objc func applyPreset(_ sender: NSMenuItem) {
         guard let presetName = sender.representedObject as? String else { return }
-        debugLog(">>> Applying preset: \(presetName)")
 
-        // User manually applying — reset failure counter for fresh attempt
-        UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
+        // No-op if already checked
+        if presetName == checkedPresetKey && isActive {
+            debugLog("applyPreset: \(presetName) already active, no-op")
+            return
+        }
+
+        debugLog(">>> Applying preset: \(presetName)")
 
         guard let config = presetConfigs[presetName] else {
             debugLog("ERROR: Unknown preset \(presetName)")
             return
         }
 
-        // If a virtual display is already active, we must restart the app to switch.
-        // CGVirtualDisplay objects persist until the process exits — releasing them
-        // does NOT remove the display. Restarting lets macOS reclaim the old one,
-        // and checkAndRestoreFromCrash() applies the new preset on relaunch.
-        if isActive || hasOrphanedVirtualDisplay() {
-            debugLog("Active display exists, saving new preset and restarting to switch cleanly...")
-            isRestarting = true
-            StatusWindowController.shared.show(message: "Switching preset...")
-            saveCurrentPreset(presetName)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-                relaunchApp()
+        UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
+
+        if isActive || VirtualDisplayManager.shared().displayExists {
+            // Active or display exists — apply in-process
+            let manager = VirtualDisplayManager.shared()
+
+            // Check if backing dimensions differ from existing display
+            let currentW = manager.maxPixelsWide
+            let currentH = manager.maxPixelsHigh
+
+            if currentW == config.width && currentH == config.height && manager.displayExists {
+                // Same framebuffer: applyModeToCurrentDisplay + re-mirror
+                debugLog("Same framebuffer (\(config.width)x\(config.height)), applying mode in-process")
+                let rate = getDisplayRefreshRate(findExternalDisplay() ?? 0)
+                manager.applyModeToCurrentDisplay(withWidth: config.width, height: config.height, refreshRate: rate)
+                saveCurrentPreset(presetName)
+                currentPresetName = "\(config.logicalWidth)x\(config.logicalHeight)"
+                // Re-mirror to apply the mode change
+                if let externalID = findExternalDisplay() {
+                    targetExternalDisplayID = externalID
+                    currentVirtualID = manager.currentDisplayID
+                    manager.resetAllMirroring()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        autoreleasepool {
+                            self?.performMirror(virtualID: manager.currentDisplayID, externalID: externalID,
+                                                config: config, generation: self?.setupGeneration ?? 0)
+                        }
+                    }
+                }
+                rebuildMenu()
+            } else {
+                // Different framebuffer: destroy old, create new
+                debugLog("Different framebuffer (\(currentW)x\(currentH) → \(config.width)x\(config.height)), recreating")
+                stopEnforcementTimers()
+                manager.destroyAllVirtualDisplays()
+                currentVirtualID = 0
+                isActive = false
+                isSettingUp = true
+                setupGeneration += 1
+                let generation = setupGeneration
+                saveCurrentPreset(presetName)
+                StatusWindowController.shared.show(message: "Switching to \(config.logicalWidth)x\(config.logicalHeight)...")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    autoreleasepool {
+                        self?.createVirtualDisplayAsync(config: config, generation: generation)
+                    }
+                }
             }
-            return
+        } else {
+            // Fresh or Ready state — just save the checkmark
+            saveCheckmarkPreset(presetName)
+            rebuildMenu()
+            debugLog("Preset \(presetName) selected (checkmark only)")
         }
-
-        // Mark that we're setting up (don't trigger cleanup during setup)
-        isSettingUp = true
-        setupGeneration += 1
-        let generation = setupGeneration
-
-        // Show status window
-        StatusWindowController.shared.show(message: "Preparing display configuration...")
-
-        // Save the preset for crash recovery
-        saveCurrentPreset(presetName)
-
-        // Schedule creation after a delay using DispatchQueue instead of Timer
-        // This gives us better control over autorelease pool behavior
-        debugLog("Scheduling display creation in 1.5 seconds...")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            autoreleasepool {
-                self?.createVirtualDisplayAsync(config: config, generation: generation)
-            }
-        }
-    }
-
-    // Disable HiDPI when user explicitly requests it - clears preset (no auto-restore)
-    func disableHiDPISync() {
-        debugLog("Disabling HiDPI (user action) - currentVirtualID: \(currentVirtualID)")
-        setupGeneration += 1  // Cancel any in-flight setup steps
-        isSettingUp = false   // A cancelled setup step won't clear this itself
-
-        let manager = VirtualDisplayManager.shared()
-
-        // Reset ALL mirroring to ensure clean state
-        manager.resetAllMirroring()
-
-        // Destroy our virtual display
-        manager.destroyAllVirtualDisplays()
-
-        currentVirtualID = 0
-        targetExternalDisplayID = 0
-        isActive = false
-        currentPresetName = ""
-
-        // Clear saved preset - user explicitly disabled, don't auto-restore
-        clearSavedPreset()
-
-        // Also clear the disconnected flag since user is taking explicit action
-        wasDisconnected = false
-        UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-
-        debugLog("HiDPI disabled (preset cleared)")
     }
 
     /// Find the highest refresh rate the panel supports across any of its modes.
@@ -2206,6 +2336,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Re-apply HDR (beta) and main-display preferences once the mirror
             // has settled — macOS resets both on login/sleep-wake.
             reassertPreferencesAfterSetup()
+
+            // Retry arrangement restore at 2s, 5s, and 8s after mirror settles.
+            // CGConfigureDisplayOrigin on the mirror master only works after macOS
+            // finishes its own async arrangement processing. Spacing out retries
+            // catches the right window regardless of when macOS settles.
+            // Observer starts after the first attempt; it won't fight us because
+            // it only saves on origin changes (not if origin stays the same).
+            let retryDelays: [Double] = [2.0, 5.0, 8.0]
+            let gen = generation  // capture for retry closures
+            for delay in retryDelays {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self, gen == self.setupGeneration else {
+                        debugLog("Arrangement: retry +\(Int(delay))s superseded, skipping")
+                        return
+                    }
+                    let bounds = CGDisplayBounds(virtualID)
+                    let currentSize = bounds.size
+                    let currentOrigin = bounds.origin
+
+                    // First-ever setup: save current position
+                    if !DisplayArrangementManager.hasSavedArrangement {
+                        DisplayArrangementManager.save(displayID: virtualID)
+                        debugLog("Arrangement: first save — origin=(\(Int(currentOrigin.x)), \(Int(currentOrigin.y))) size=(\(Int(currentSize.width)), \(Int(currentSize.height)))")
+                    }
+
+                    // Restore if saved target differs from current
+                    if let target = DisplayArrangementManager.targetOrigin(for: currentSize),
+                       target != currentOrigin {
+                        debugLog("Arrangement: restoring at +\(Int(delay))s — from (\(Int(currentOrigin.x)), \(Int(currentOrigin.y))) to (\(Int(target.x)), \(Int(target.y)))")
+                        var config: CGDisplayConfigRef?
+                        if CGBeginDisplayConfiguration(&config) == .success {
+                            CGConfigureDisplayOrigin(config, virtualID, Int32(target.x), Int32(target.y))
+                            let err = CGCompleteDisplayConfiguration(config, .permanently)
+                            let settled = CGDisplayBounds(virtualID).origin
+                            debugLog("Arrangement: restore result=\(err), settled at (\(Int(settled.x)), \(Int(settled.y)))")
+                            // Only persist if WindowServer actually moved the display.
+                            // Writing the wrong position poisons the saved arrangement.
+                            if settled != currentOrigin {
+                                DisplayArrangementManager.save(displayID: virtualID)
+                            }
+                        }
+                    } else if delay == retryDelays[0] {
+                        debugLog("Arrangement: already at target (\(Int(currentOrigin.x)), \(Int(currentOrigin.y))) at +\(Int(delay))s")
+                    }
+
+                    // Start observer after first attempt
+                    if delay == retryDelays[0] {
+                        self.startEnforcementTimers(virtualID: virtualID)
+                    }
+                }
+            }
         } else {
             debugLog("Mirror failed, cleaning up...")
             manager.destroyVirtualDisplay(virtualID)
@@ -2213,18 +2394,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             isActive = false
             currentPresetName = ""
 
-            // Track consecutive failures to prevent infinite restart loops
             let failCount = UserDefaults.standard.integer(forKey: kMirrorFailureCountKey) + 1
             UserDefaults.standard.set(failCount, forKey: kMirrorFailureCountKey)
 
             if failCount < maxMirrorRetries {
-                // Allow retry — set wasDisconnected so periodic check will auto-apply
                 wasDisconnected = true
                 UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
                 debugLog("Mirror failure \(failCount)/\(maxMirrorRetries), will retry when monitor is ready")
                 StatusWindowController.shared.updateStatus("Waiting for display...")
             } else {
-                // Too many failures — stop the auto-retry loop
                 wasDisconnected = false
                 UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
                 debugLog("Mirror failed \(failCount) times, stopping auto-retry. Use menu to apply manually.")
@@ -2430,53 +2608,199 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Shared relaunch preamble for menu actions that restart the app.
-    /// - Parameters:
-    ///   - message: Status window message shown before restart
-    ///   - clearPreset: If true, clears the saved preset so relaunch does NOT restore HiDPI
-    private func scheduleRelaunch(message: String, clearPreset: Bool) {
-        debugLog("scheduleRelaunch: message=\(message), clearPreset=\(clearPreset), isActive=\(isActive)")
-        StatusWindowController.shared.show(message: message)
-        isRestarting = true
-        if clearPreset { clearSavedPreset() }
-        wasDisconnected = false
-        UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-            debugLog("scheduleRelaunch: firing relaunchApp()")
-            relaunchApp()
+    @objc func toggleHiDPIEnabled(_ sender: NSMenuItem) {
+        let currentlyEnabled = UserDefaults.standard.bool(forKey: kHiDPIEnabledKey)
+        if currentlyEnabled {
+            // Unchecking — tear down, prevent auto-restore.
+            // Clear flags unconditionally (covers the disconnected-state edge
+            // case where the display was already torn down but flags linger).
+            debugLog("toggleHiDPIEnabled: disabling")
+            UserDefaults.standard.set(false, forKey: kHiDPIEnabledKey)
+            setupGeneration += 1
+            isSettingUp = false
+            let manager = VirtualDisplayManager.shared()
+            if manager.displayExists {
+                manager.unmirrorAndDeactivate()
+                stopEnforcementTimers()
+                manager.destroyAllVirtualDisplays()
+            }
+            currentVirtualID = 0
+            targetExternalDisplayID = 0
+            isActive = false
+            wasDisconnected = false
+            currentPresetName = ""
+            UserDefaults.standard.set(false, forKey: kAutoRestoreKey)
+            UserDefaults.standard.set(false, forKey: kWasDisconnectedKey)
+            rebuildMenu()
+        } else {
+            // Checking — enable immediately if monitor present, arm and wait if not
+            debugLog("toggleHiDPIEnabled: enabling")
+            UserDefaults.standard.set(true, forKey: kHiDPIEnabledKey)
+            guard let presetName = UserDefaults.standard.string(forKey: kLastPresetKey),
+                  !presetName.isEmpty else {
+                rebuildMenu()
+                return
+            }
+            // Resolve config
+            let config: PresetConfig
+            if let standard = presetConfigs[presetName] {
+                config = standard
+            } else if presetName.hasPrefix("custom-"),
+                      let dict = UserDefaults.standard.dictionary(forKey: "customPresetConfig"),
+                      let name = dict["name"] as? String,
+                      let width = (dict["width"] as? NSNumber)?.uint32Value,
+                      let height = (dict["height"] as? NSNumber)?.uint32Value,
+                      let logicalWidth = (dict["logicalWidth"] as? NSNumber)?.uint32Value,
+                      let logicalHeight = (dict["logicalHeight"] as? NSNumber)?.uint32Value,
+                      let ppi = (dict["ppi"] as? NSNumber)?.uint32Value,
+                      let hiDPI = dict["hiDPI"] as? Bool {
+                config = PresetConfig(name: name, width: width, height: height, logicalWidth: logicalWidth, logicalHeight: logicalHeight, ppi: ppi, hiDPI: hiDPI)
+            } else {
+                rebuildMenu()
+                return
+            }
+            UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
+            isSettingUp = true
+            setupGeneration += 1
+            let generation = setupGeneration
+            StatusWindowController.shared.show(message: "Enabling HiDPI...")
+            let manager = VirtualDisplayManager.shared()
+            if manager.displayExists {
+                let currentW = manager.maxPixelsWide
+                let currentH = manager.maxPixelsHigh
+                if currentW == config.width && currentH == config.height {
+                    debugLog("toggleHiDPIEnabled: reusing existing display \(manager.currentDisplayID)")
+                    saveCurrentPreset(presetName)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        autoreleasepool {
+                            self?.reestablishMirrorOnExistingDisplay(generation: generation)
+                        }
+                    }
+                    return
+                }
+                debugLog("toggleHiDPIEnabled: dimensions changed, recreating")
+                manager.destroyAllVirtualDisplays()
+                currentVirtualID = 0
+            }
+            saveCurrentPreset(presetName)
+            // Arm reconnect: if createVirtualDisplayAsync fails (no monitor),
+            // wasDisconnected stays true so periodicDisplayCheck/handleDisplay-
+            // ConfigurationChange will auto-connect when the monitor appears.
+            wasDisconnected = true
+            UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                autoreleasepool {
+                    self?.createVirtualDisplayAsync(config: config, generation: generation)
+                }
+            }
+        }
+    }
+
+    /// Re-mirror an existing virtual display to the current external display.
+    /// Used after Disable→Enable (same preset) and on reconnect.
+    /// Preserves currentPresetName across the call — performMirror overwrites it
+    /// from config, but during re-mirror the config is unknown (we're just re-
+    /// attaching the existing display). Restore from kLastPresetKey after.
+    func reestablishMirrorOnExistingDisplay(generation: Int) {
+        // Stop any running observer — during the re-mirror window the virtual
+        // display is standalone and the observer would save a transient position.
+        stopEnforcementTimers()
+
+        guard generation == setupGeneration else {
+            debugLog("Stale reestablishMirror, aborting")
+            return
+        }
+        guard let externalID = findExternalDisplay() else {
+            debugLog("reestablishMirrorOnExistingDisplay: no external display found")
+            isSettingUp = false
+            StatusWindowController.shared.hide()
+            return
+        }
+        let manager = VirtualDisplayManager.shared()
+        let virtualID = manager.currentDisplayID
+        guard virtualID != kCGNullDirectDisplay else {
+            debugLog("reestablishMirrorOnExistingDisplay: no virtual display — recreating from preset")
+            // Mirror-failure fallback: spec §8. Destroy and recreate as last resort.
+            stopEnforcementTimers()
+            manager.destroyAllVirtualDisplays()
+            currentVirtualID = 0
+            if let presetName = UserDefaults.standard.string(forKey: kLastPresetKey),
+               !presetName.isEmpty {
+                restorePreset(presetName)
+            }
+            return
+        }
+
+        debugLog("Reestablishing mirror: \(virtualID) -> \(externalID)")
+        currentVirtualID = virtualID
+        targetExternalDisplayID = externalID
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            autoreleasepool {
+                self?.performMirror(virtualID: virtualID, externalID: externalID,
+                                    config: PresetConfig(name: "", width: manager.maxPixelsWide,
+                                                         height: manager.maxPixelsHigh,
+                                                         logicalWidth: manager.maxPixelsWide / 2,
+                                                         logicalHeight: manager.maxPixelsHigh / 2,
+                                                         ppi: 140, hiDPI: true),
+                                    generation: generation)
+            }
         }
     }
 
     @objc func reapplyHiDPIAction() {
         debugLog("reapplyHiDPIAction called, isRestarting=\(isRestarting), isActive=\(isActive)")
-        guard !isRestarting else { debugLog("reapplyHiDPIAction: blocked by isRestarting guard"); return }
-        // Reapply: restart and restore the current preset.
-        // The preset is already saved in kLastPresetKey from when it was first applied.
-        // Just relaunch — checkAndRestoreFromCrash() will re-apply it.
-        if isActive || hasOrphanedVirtualDisplay() {
-            scheduleRelaunch(message: "Reapplying HiDPI...", clearPreset: false)
+        guard !isRestarting, !isSettingUp else {
+            debugLog("reapplyHiDPIAction: blocked")
             return
         }
-        // No active display — nothing to reapply
-        debugLog("reapplyHiDPIAction: no active display, rebuilding menu")
-        rebuildMenu()
-    }
+        guard isActive || VirtualDisplayManager.shared().displayExists else {
+            debugLog("reapplyHiDPIAction: no active display, nothing to reapply")
+            rebuildMenu()
+            return
+        }
 
-    @objc func disableHiDPIAction() {
-        guard !isRestarting else { return }
-        // Virtual displays persist until process exit — must restart to truly remove them
-        if isActive || hasOrphanedVirtualDisplay() {
-            scheduleRelaunch(message: "Disabling HiDPI...", clearPreset: true)
-            return
+        let manager = VirtualDisplayManager.shared()
+
+        if manager.displayExists && manager.currentDisplayID != kCGNullDirectDisplay {
+            // Healthy display: break mirror and re-establish.
+            // Stop observer BEFORE breaking mirror — otherwise the 2s timer
+            // fires during the standalone window and saves a transient position,
+            // corrupting the user's saved arrangement.
+            isSettingUp = true
+            setupGeneration += 1
+            let generation = setupGeneration
+            stopEnforcementTimers()
+            StatusWindowController.shared.show(message: "Reapplying HiDPI...")
+            manager.resetAllMirroring()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                autoreleasepool {
+                    self?.reestablishMirrorOnExistingDisplay(generation: generation)
+                }
+            }
+        } else {
+            // Bad state: recreate from saved preset
+            guard let presetName = UserDefaults.standard.string(forKey: kLastPresetKey),
+                  !presetName.isEmpty else {
+                debugLog("reapplyHiDPIAction: no saved preset to restore from")
+                return
+            }
+            debugLog("reapplyHiDPIAction: display in bad state, recreating from preset \(presetName)")
+            manager.destroyAllVirtualDisplays()
+            currentVirtualID = 0
+            restorePreset(presetName)
         }
-        // No active display — just clean up in-process state
-        disableHiDPISync()
-        rebuildMenu()
     }
 
     @objc func quitApp() {
         debugLog("Quit requested by user")
-        disableHiDPISync()
+        // Save arrangement before quitting
+        let manager = VirtualDisplayManager.shared()
+        if manager.displayExists {
+            DisplayArrangementManager.save(displayID: manager.currentDisplayID)
+        }
+        // Preserve kLastPresetKey and kAutoRestoreKey for next launch
+        // (toggleHiDPIEnabled already cleared kAutoRestoreKey if user unchecked)
         NSApp.terminate(nil)
     }
 }

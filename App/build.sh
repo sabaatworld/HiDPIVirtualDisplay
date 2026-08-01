@@ -13,7 +13,7 @@ RESOURCES="${CONTENTS}/Resources"
 MODULE_CACHE_DIR="${BUILD_DIR}/.module-cache"
 
 # Source files
-SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift"
+SWIFT_SOURCES="Sources/HiDPIDisplayApp.swift Sources/DisplayArrangementManager.swift"
 OBJC_SOURCES="Sources/VirtualDisplayManager.m"
 BRIDGING_HEADER="Sources/BridgingHeader.h"
 
