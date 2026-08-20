@@ -1410,15 +1410,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 debugLog("Disconnect attempt \(attempt)/3 — retrying in \(delay)s")
                 self.confirmDisconnect(attempt: attempt + 1)
             } else {
-                // Confirmed disconnect — just un-mirror, keep display alive
-                debugLog(">>> Disconnect confirmed — un-mirroring virtual display")
+                // Confirmed disconnect — destroy the display so macOS
+                // doesn't see a ghost extra display. The reconnect paths
+                // will recreate it via restorePreset when the monitor returns.
+                debugLog(">>> Disconnect confirmed — destroying virtual display")
                 self.disconnectConfirmationPending = false
                 self.wasDisconnected = true
                 UserDefaults.standard.set(true, forKey: kWasDisconnectedKey)
                 UserDefaults.standard.set(0, forKey: kMirrorFailureCountKey)
 
                 let manager = VirtualDisplayManager.shared()
-                manager.unmirrorAndDeactivate()
+                manager.resetAllMirroring()
+                manager.destroyAllVirtualDisplays()
                 self.isActive = false
                 self.stopEnforcementTimers()
                 self.rebuildMenu()
@@ -2686,9 +2689,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setupGeneration += 1
             isSettingUp = false
             let manager = VirtualDisplayManager.shared()
+            stopEnforcementTimers()
+            manager.resetAllMirroring()
             if manager.displayExists {
-                manager.unmirrorAndDeactivate()
-                stopEnforcementTimers()
                 manager.destroyAllVirtualDisplays()
             }
             currentVirtualID = 0
